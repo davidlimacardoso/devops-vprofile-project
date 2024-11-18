@@ -1,0 +1,129 @@
+pipeline {
+    agent any
+    tools {
+        maven "MAVEN3.9"
+        jdk "JDK17"
+    }
+
+    environment {
+        appRegistry = "893777461466.dkr.ecr.us-east-1.amazonaws.com/vprofileappimg"
+        buildNumber = "${env.BUILD_NUMBER}"
+        ecrRegion = "us-east-1"
+        cluster = "vprofile"
+        service = "vprofile-dev-svc-vprofileapp-v2"
+    }
+    
+    stages {
+        stage('Fetch code') {
+            steps {
+                git branch: 'docker', url: 'https://github.com/davidlimacardoso/devops-vprofile-project.git'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'mvn install -DskipTests'
+            }
+            post {
+                success {
+                    echo 'Now Archiving it...'
+                    archiveArtifacts artifacts: '**/target/*.war'
+                }
+            }
+        }
+
+        stage('UNIT TEST') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+
+        stage('Checkstyle Analysis') {
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+            }
+        }
+
+        stage("Sonar Code Analysis") {
+            environment {
+                scannerHome = tool 'sonar6.2'
+            }
+            steps {
+                withSonarQubeEnv('sonarserver') {
+                    sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
+                       -Dsonar.projectName=vprofile \
+                       -Dsonar.projectVersion=1.0 \
+                       -Dsonar.sources=src/ \
+                       -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                       -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                       -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                       -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+                }
+            }
+        }
+
+        stage("Quality Gate") {
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Get Login ECR') {
+            steps {
+                script {
+                    def ecrLogin = sh(script: "aws ecr get-login-password --region ${ecrRegion} | docker login --username AWS --password-stdin ${appRegistry}", returnStatus: true)
+                    if (ecrLogin != 0) {
+                        error "Failed to login to ECR"
+                    }
+                }
+            }
+        }
+
+        stage('Build App Image') {
+            steps {
+                script {
+                    def imageTag = "${appRegistry}:${buildNumber}"
+                    def latestTag = "${appRegistry}:latest"
+
+                    // Construct a new image
+                    sh "docker build -t vprofileappimg:${buildNumber} ./Docker-files/app/multistage/"
+
+                    // Tagging image to ECR ECR
+                    sh "docker tag vprofileappimg:${buildNumber} ${imageTag}"
+                    sh "docker tag vprofileappimg:${buildNumber} ${latestTag}"
+
+                    // Pushing the images to ECR
+                    sh "docker push ${imageTag}"
+                    sh "docker push ${latestTag}"
+                }
+            }
+        }
+
+        stage('Remove Local Container Images') {
+            steps {
+                script {
+                    sh "docker rmi -f \$(docker images -a -q)"
+                }
+            }
+        }
+
+        stage('Deploy to ecs') {
+          steps {
+            script {
+                sh 'aws ecs update-service --cluster ${cluster} --service ${service} --force-new-deployment'
+            }
+          }
+        }
+    }
+
+    post {
+        always {
+            echo 'Slack Notifications.'
+            slackSend channel: '#alerts-cicd',
+                color: COLOR_MAP[currentBuild.currentResult],
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
+        }
+    }
+}
