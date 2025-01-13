@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx2
+  labels:
+    app: front
+  namespace: webfront
+spec:
+  containers:
+  - name: nginx
+    image: nginx:latest
+    ports:
+    - name: webfront-port
+      containerPort: 80
